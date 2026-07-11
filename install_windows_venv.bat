@@ -28,8 +28,8 @@ call venv\Scripts\activate.bat
 
 echo [3/3] Installing Python dependencies...
 python -m pip install --upgrade pip
-pip install numpy==1.26.4
-pip install -r requirements.txt
+python -m pip install --force-reinstall numpy==1.26.4 scipy==1.11.4 scikit-image==0.22.0 albumentations==1.4.3 opencv-python==4.10.0.84
+python -m pip install -r requirements.txt --upgrade --upgrade-strategy eager
 
 echo ==========================================================
 echo  Downloading required AI models...

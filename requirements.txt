@@ -1,5 +1,8 @@
 numpy==1.26.4
-opencv-python
+scipy==1.11.4
+scikit-image==0.22.0
+albumentations==1.4.3
+opencv-python==4.10.0.84
 onnxruntime-gpu
 insightface
 gradio==6.19.0
