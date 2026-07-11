@@ -992,12 +992,5 @@ with gr.Blocks() as demo:
     gr.Markdown("Built with Python, Gradio, ONNX Runtime, and OpenCV.", elem_classes="footer-text")
 
 if __name__ == "__main__":
-    # Detect proxy paths for OVHcloud / Jupyter proxy environments
-    root_path = ""
-    if os.environ.get("JUPYTERHUB_SERVICE_PREFIX"):
-        root_path = os.environ.get("JUPYTERHUB_SERVICE_PREFIX").rstrip("/")
-    elif os.path.exists("/workspace"):
-        root_path = "/proxy/7860"
-        
-    print(f"[Gradio] Launching server on port 7860 with root_path='{root_path}'")
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True, root_path=root_path)
+    print("[Gradio] Launching local-only server: http://127.0.0.1:7860")
+    demo.launch(server_name="127.0.0.1", server_port=7860, share=False)
