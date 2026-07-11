@@ -256,6 +256,32 @@ class SwapEngine:
             occluder_session = self.occluder_session
         return generate_occlusion_mask(face_crop, occluder_session)
 
+    def _soften_face_mask(self, mask, face_h, face_w):
+        """
+        Builds a wider, smoother alpha transition around the face hull.
+        This reduces visible cheek/jaw seams without expanding far enough to cover hair or hands.
+        """
+        mask_u8 = np.clip(mask, 0, 255).astype(np.uint8)
+        face_size = max(face_h, face_w)
+
+        dilate_size = int(face_size * 0.035)
+        dilate_size = max(3, dilate_size)
+        dilate_size = dilate_size + 1 if dilate_size % 2 == 0 else dilate_size
+
+        blur_size = int(face_size * 0.22)
+        blur_size = max(9, blur_size)
+        blur_size = blur_size + 1 if blur_size % 2 == 0 else blur_size
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
+        mask_u8 = cv2.dilate(mask_u8, kernel, iterations=1)
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        soft_mask = cv2.GaussianBlur(mask_u8.astype(np.float32), (blur_size, blur_size), blur_size / 3.0) / 255.0
+        soft_mask = np.clip(soft_mask, 0.0, 1.0)
+        # Smoothstep keeps the center solid while making cheek/jaw edges transition gently.
+        soft_mask = soft_mask * soft_mask * (3.0 - 2.0 * soft_mask)
+        return np.expand_dims(soft_mask, axis=2)
+
     def face_swap(self, source_img, target_img, enhance=True, enhance_strength=0.8, match_color=True, match_scale=False, custom_scale=1.0, det_thresh=0.5, face_upscale_resolution="512", handle_occlusions=True, target_rotation=None, log_callback=None, swap_blend_strength=0.85, match_face_shape=True, pipeline=None, target_faces=None, target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
         """
         Swaps face from source_img onto target_img with auto-rotation, upscaling, and occlusion handling.
@@ -599,16 +625,9 @@ class SwapEngine:
                     axes = (swapped_face_crop.shape[1] // 2, swapped_face_crop.shape[0] // 2)
                     cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
                 
-                # Dynamic feathering based on face size to ensure 100% invisible seams at any scale
+                # Dynamic feathering based on face size to avoid visible cheek/jaw seams.
                 face_h, face_w = swapped_face_crop.shape[:2]
-                blur_size = int(max(face_h, face_w) * 0.15)
-                blur_size = blur_size + 1 if blur_size % 2 == 0 else blur_size
-                blur_size = max(5, blur_size)
-                blur_sigma = blur_size / 2.0
-                
-                # Feather mask boundaries dynamically
-                mask = cv2.GaussianBlur(mask, (blur_size, blur_size), blur_sigma) / 255.0
-                mask = np.expand_dims(mask, axis=2)
+                mask = self._soften_face_mask(mask, face_h, face_w)
                 
                 # 4. Handle Occlusions (hands, hair, objects blocking the face)
                 if handle_occlusions and occluder_session is not None:
