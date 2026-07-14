@@ -77,6 +77,7 @@ gradio_client.utils.get_type = patched_get_type
 
 import gradio as gr
 import cv2
+import numpy as np
 import onnxruntime as ort
 
 orig_init = ort.InferenceSession.__init__
@@ -531,10 +532,52 @@ def perform_video_swap(source_img, target_video, enhance, enhance_strength, matc
         """
         yield None, logs, error_html
 
+def _resolve_uploaded_path(upload_value):
+    if isinstance(upload_value, dict):
+        return upload_value.get("path") or upload_value.get("name")
+    return getattr(upload_value, "name", upload_value)
+
+def _make_proxy_head_rgba(width, height):
+    head = np.zeros((height, width, 4), dtype=np.uint8)
+    center = (width // 2, height // 2)
+    axes = (max(4, int(width * 0.38)), max(6, int(height * 0.46)))
+    cv2.ellipse(head, center, axes, 0, 0, 360, (178, 142, 118, 235), -1)
+    cv2.ellipse(head, (center[0] - width // 10, center[1] - height // 10), (max(2, width // 16), max(2, height // 22)), 0, 0, 360, (55, 42, 38, 240), -1)
+    cv2.ellipse(head, (center[0] + width // 10, center[1] - height // 10), (max(2, width // 16), max(2, height // 22)), 0, 0, 360, (55, 42, 38, 240), -1)
+    cv2.ellipse(head, (center[0], center[1] + height // 8), (max(3, width // 9), max(2, height // 35)), 0, 0, 180, (88, 48, 48, 230), 2)
+    alpha = head[:, :, 3].astype(np.float32)
+    blur = max(5, (min(width, height) // 12) | 1)
+    head[:, :, 3] = cv2.GaussianBlur(alpha, (blur, blur), 0).astype(np.uint8)
+    return head
+
+def _overlay_rgba(frame, overlay, center_x, center_y):
+    h, w = frame.shape[:2]
+    oh, ow = overlay.shape[:2]
+    x1 = int(center_x - ow / 2)
+    y1 = int(center_y - oh / 2)
+    x2 = x1 + ow
+    y2 = y1 + oh
+    ox1 = max(0, -x1)
+    oy1 = max(0, -y1)
+    ox2 = ow - max(0, x2 - w)
+    oy2 = oh - max(0, y2 - h)
+    bx1 = max(0, x1)
+    by1 = max(0, y1)
+    bx2 = min(w, x2)
+    by2 = min(h, y2)
+    if bx2 <= bx1 or by2 <= by1 or ox2 <= ox1 or oy2 <= oy1:
+        return frame
+    patch = overlay[oy1:oy2, ox1:ox2]
+    rgb = patch[:, :, :3].astype(np.float32)
+    alpha = patch[:, :, 3:4].astype(np.float32) / 255.0
+    base = frame[by1:by2, bx1:bx2].astype(np.float32)
+    frame[by1:by2, bx1:bx2] = np.clip(rgb * alpha + base * (1.0 - alpha), 0, 255).astype(np.uint8)
+    return frame
+
 def perform_3d_head_composite(head_model, target_video, anchor_mode, render_backend, head_scale, vertical_offset, save_path=""):
     logs = "[3D Head] Initializing separate 3D head composite pipeline...\n"
 
-    model_path = getattr(head_model, "name", head_model)
+    model_path = _resolve_uploaded_path(head_model)
     video_path = target_video
 
     if not model_path:
@@ -547,16 +590,127 @@ def perform_3d_head_composite(head_model, target_video, anchor_mode, render_back
     if model_ext not in supported_exts:
         return None, logs + f"[Error] Unsupported 3D model format: {model_ext}. Use GLB, GLTF, OBJ, FBX, or BLEND.\n"
 
+    if render_backend not in ("CPU Preview (Working)", "CPU Preview"):
+        logs += f"[Warning] {render_backend} is reserved for the full renderer path. Running CPU Preview backend now.\n"
+
     logs += f"[3D Head] Model: {model_path}\n"
     logs += f"[3D Head] Target video: {video_path}\n"
     logs += f"[3D Head] Anchor mode: {anchor_mode}\n"
-    logs += f"[3D Head] Render backend: {render_backend}\n"
+    logs += "[3D Head] Render backend: CPU Preview (Working)\n"
     logs += f"[3D Head] Scale: {head_scale:.2f}, vertical offset: {vertical_offset:.2f}\n"
-    if save_path and save_path.strip():
-        logs += f"[3D Head] Requested save path: {save_path.strip()}\n"
-    logs += "[3D Head] Menu is ready and isolated from normal face swap.\n"
-    logs += "[3D Head] Renderer connection is not enabled yet. Next step is wiring the selected backend to track neck/shoulders and render the model per frame.\n"
-    return None, logs
+
+    try:
+        import mediapipe as mp
+        import imageio_ffmpeg
+        import shutil
+        import subprocess
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None, logs + "[Error] Could not open target video.\n"
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        temp_dir = tempfile.mkdtemp(prefix="head3d_")
+        silent_path = os.path.join(temp_dir, "head3d_silent.mp4")
+        final_tmp = os.path.join(temp_dir, "head3d_final.mp4")
+        writer = cv2.VideoWriter(silent_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            cap.release()
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return None, logs + "[Error] Could not create output video writer.\n"
+
+        mp_pose = mp.solutions.pose
+        last_anchor = None
+        processed = 0
+        detected = 0
+
+        with mp_pose.Pose(static_image_mode=False, model_complexity=1, enable_segmentation=False, min_detection_confidence=0.35, min_tracking_confidence=0.35) as pose:
+            while True:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    break
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                result = pose.process(rgb)
+                anchor = None
+
+                if result.pose_landmarks:
+                    lm = result.pose_landmarks.landmark
+                    left_shoulder = lm[11]
+                    right_shoulder = lm[12]
+                    shoulder_vis = min(left_shoulder.visibility, right_shoulder.visibility)
+                    if shoulder_vis > 0.25:
+                        lx, ly = left_shoulder.x * width, left_shoulder.y * height
+                        rx, ry = right_shoulder.x * width, right_shoulder.y * height
+                        sx = (lx + rx) * 0.5
+                        sy = (ly + ry) * 0.5
+                        shoulder_w = max(float(np.hypot(lx - rx, ly - ry)), width * 0.08)
+
+                        if anchor_mode == "Face Re-entry Assist" and lm[0].visibility > 0.35:
+                            anchor_x = lm[0].x * width
+                            anchor_y = lm[0].y * height
+                        elif anchor_mode == "Manual Center Anchor":
+                            anchor_x = width * 0.5
+                            anchor_y = height * 0.38
+                        else:
+                            anchor_x = sx
+                            anchor_y = sy - shoulder_w * (0.95 - vertical_offset * 0.45)
+
+                        head_h = shoulder_w * 1.18 * float(head_scale)
+                        head_w = head_h * 0.78
+                        anchor = np.array([anchor_x, anchor_y, head_w, head_h], dtype=np.float32)
+                        detected += 1
+                elif anchor_mode == "Manual Center Anchor":
+                    head_h = height * 0.28 * float(head_scale)
+                    anchor = np.array([width * 0.5, height * (0.38 + vertical_offset * 0.15), head_h * 0.78, head_h], dtype=np.float32)
+
+                if anchor is not None:
+                    last_anchor = anchor if last_anchor is None else (0.28 * anchor + 0.72 * last_anchor)
+
+                if last_anchor is not None:
+                    ow = max(24, int(last_anchor[2]))
+                    oh = max(32, int(last_anchor[3]))
+                    head_rgba = _make_proxy_head_rgba(ow, oh)
+                    frame = _overlay_rgba(frame, head_rgba, last_anchor[0], last_anchor[1])
+
+                writer.write(frame)
+                processed += 1
+
+        cap.release()
+        writer.release()
+
+        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        merge_cmd = [
+            ffmpeg_bin, "-y", "-i", silent_path, "-i", video_path,
+            "-map", "0:v", "-map", "1:a?", "-c:v", "libx264", "-c:a", "aac", "-shortest", final_tmp,
+        ]
+        merge = subprocess.run(merge_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        output_source = final_tmp if merge.returncode == 0 and os.path.exists(final_tmp) else silent_path
+
+        dest = save_path.strip() if (save_path and save_path.strip()) else ""
+        if not dest:
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            os.makedirs("output", exist_ok=True)
+            dest = os.path.join("output", f"head3d_preview_{timestamp}.mp4")
+        os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+        shutil.copy(output_source, dest)
+
+        logs += f"[3D Head] Processed {processed}/{total_frames or processed} frames.\n"
+        logs += f"[3D Head] Pose anchors detected on {detected} frames.\n"
+        logs += "[3D Head] CPU Preview rendered a tracked proxy head. Full 3D model rendering is the next backend step.\n"
+        logs += f"[3D Head] Output saved to: {os.path.abspath(dest)}\n"
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return dest, logs
+    except Exception as e:
+        import traceback
+        logs += f"[Error] 3D Head composite failed: {str(e)}\n"
+        logs += traceback.format_exc() + "\n"
+        return None, logs
 
 # Custom CSS for Premium Dark UI theme
 custom_css = """
@@ -1042,8 +1196,8 @@ with gr.Blocks() as demo:
                         label="Anchor Mode"
                     )
                     head3d_backend = gr.Dropdown(
-                        choices=["Blender Offscreen", "OpenGL/ModernGL", "CPU Preview"],
-                        value="Blender Offscreen",
+                        choices=["CPU Preview (Working)", "Blender Offscreen", "OpenGL/ModernGL"],
+                        value="CPU Preview (Working)",
                         label="Render Backend"
                     )
                     head3d_scale = gr.Slider(label="Head Scale", minimum=0.5, maximum=2.0, value=1.0, step=0.05)
